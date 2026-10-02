@@ -51,6 +51,7 @@ archivar --as martin commit $p
 archivar blame $doc | from json
 
 # Claude guesses a link; Martin makes it canonical.
+let other = archivar --as martin ingest notes/gasket.md --tier canonical | from json
 let r = archivar --as martin --agent claude link $doc $other --kind cites --confidence 0.8 | from json
 archivar --as martin promote $r
 archivar related $doc --depth 2 --tier canonical | from json

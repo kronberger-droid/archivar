@@ -200,6 +200,9 @@ pub struct HistoryEntry {
     pub proposed_via: Option<String>,
     pub version: Option<i32>,
     pub body: Option<String>,
+    /// The event payload for relation events, which have no version or body:
+    /// what was asserted, or which tiers a promotion moved between.
+    pub detail: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -790,19 +793,21 @@ impl Store {
 
     // History -------------------------------------------------------------
 
-    pub async fn history(&self, block: Uuid) -> Result<Vec<HistoryEntry>> {
+    /// Every recorded change to a block or a relation.
+    pub async fn history(&self, id: Uuid) -> Result<Vec<HistoryEntry>> {
         Ok(sqlx::query_as(
             "SELECT e.seq, e.at, e.kind, p.name AS principal, e.agent, e.proposal_id,
                     pp.name AS proposed_by, pr.agent AS proposed_via,
-                    (e.payload->>'version')::int AS version, e.payload->>'body' AS body
+                    (e.payload->>'version')::int AS version, e.payload->>'body' AS body,
+                    CASE WHEN e.relation_id IS NOT NULL THEN e.payload END AS detail
              FROM core.events e
              JOIN core.principals p ON p.id = e.principal_id
              LEFT JOIN core.proposals pr ON pr.id = e.proposal_id
              LEFT JOIN core.principals pp ON pp.id = pr.principal_id
-             WHERE e.block_id = $1
+             WHERE e.block_id = $1 OR e.relation_id = $1
              ORDER BY e.seq",
         )
-        .bind(block)
+        .bind(id)
         .fetch_all(&self.pool)
         .await?)
     }

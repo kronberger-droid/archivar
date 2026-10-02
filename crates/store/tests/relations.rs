@@ -105,6 +105,23 @@ async fn only_a_human_hand_makes_a_link_canonical(pool: PgPool) {
     assert_eq!(r.agent.as_deref(), Some("claude"));
     assert_eq!(r.promoted_by.as_deref(), Some("alice"));
 
+    let history = store.history(guess).await.unwrap();
+    let steps: Vec<_> = history
+        .iter()
+        .map(|h| (h.kind.as_str(), h.principal.as_str(), h.agent.as_deref()))
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            ("relation_asserted", "alice", Some("claude")),
+            ("relation_promoted", "alice", None)
+        ]
+    );
+    assert_eq!(
+        history[1].detail,
+        Some(serde_json::json!({ "from": "derived", "to": "canonical" }))
+    );
+
     // Once canonical, the agent can't take it back either.
     assert!(matches!(
         store.unlink(&alice_via_claude, guess).await,

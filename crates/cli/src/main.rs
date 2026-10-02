@@ -64,8 +64,8 @@ enum Command {
     Commit { proposal: Uuid },
     /// Close a proposal without applying it.
     Reject { proposal: Uuid },
-    /// Every recorded change to a block.
-    History { block: Uuid },
+    /// Every recorded change to a block or a relation.
+    History { id: Uuid },
     /// Who last changed each block of a document.
     Blame { doc: Uuid },
     /// Relate two documents or blocks. Needs the commit right in the tier,
@@ -262,7 +262,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Commit { proposal } => store.commit(&actor()?, proposal).await?,
         Command::Reject { proposal } => store.reject(&actor()?, proposal).await?,
-        Command::History { block } => print_json(&store.history(block).await?)?,
+        Command::History { id } => print_json(&store.history(id).await?)?,
         Command::Blame { doc } => print_json(&store.blame(doc).await?)?,
         Command::Link {
             from,

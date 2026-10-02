@@ -16,7 +16,14 @@ Slice 1, the trust core, as a CLI:
 - `history` per block, `blame` per document, naming principal and agent
 - `query`: read-only SQL against the published `read` schema
 
-Not yet: relations, the MCP server, the Word codec, purge.
+Slice 2, relations:
+
+- `link` / `unlink` between documents and blocks, each relation with its own
+  tier, asserter, agent and confidence
+- agents link into `derived`; only a human hand can `promote` a link to `canonical`
+- `related`: walk the graph by depth, direction and tier
+
+Not yet: the MCP server, the Word codec, purge.
 
 ## Development
 
@@ -42,6 +49,11 @@ archivar review $p
 archivar --as martin commit $p
 
 archivar blame $doc | from json
+
+# Claude guesses a link; Martin makes it canonical.
+let r = archivar --as martin --agent claude link $doc $other --kind cites --confidence 0.8 | from json
+archivar --as martin promote $r
+archivar related $doc --depth 2 --tier canonical | from json
 archivar query "select principal, agent, kind from events order by seq" | from json
 ```
 

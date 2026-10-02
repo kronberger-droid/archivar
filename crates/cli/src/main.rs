@@ -6,7 +6,7 @@ use std::io::Read;
 use std::path::PathBuf;
 
 use anyhow::{Context, bail};
-use archivar_store::{Actor, Change, Store, Tier};
+use archivar_store::{Actor, Change, Direction, NewRelation, Store, Tier};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use uuid::Uuid;
@@ -68,6 +68,38 @@ enum Command {
     History { block: Uuid },
     /// Who last changed each block of a document.
     Blame { doc: Uuid },
+    /// Relate two documents or blocks. Needs the commit right in the tier,
+    /// so agents link into `derived`.
+    Link {
+        from: Uuid,
+        to: Uuid,
+        /// What the link means, like `cites` or `supersedes`.
+        #[arg(long)]
+        kind: String,
+        #[arg(long, default_value = "derived")]
+        tier: Tier,
+        /// How sure the asserter is, from 0 to 1.
+        #[arg(long)]
+        confidence: Option<f64>,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Retract a relation.
+    Unlink { relation: Uuid },
+    /// Make a relation canonical.
+    Promote { relation: Uuid },
+    /// Relations around a document or block, walking up to DEPTH steps.
+    Related {
+        node: Uuid,
+        #[arg(long, default_value_t = 1)]
+        depth: u32,
+        /// out, in or both.
+        #[arg(long, default_value = "both")]
+        direction: Direction,
+        /// Follow only relations in these tiers. Repeatable.
+        #[arg(long)]
+        tier: Vec<Tier>,
+    },
     /// Run a read-only SELECT against the published read schema.
     Query { sql: String },
 }
@@ -232,6 +264,32 @@ async fn main() -> anyhow::Result<()> {
         Command::Reject { proposal } => store.reject(&actor()?, proposal).await?,
         Command::History { block } => print_json(&store.history(block).await?)?,
         Command::Blame { doc } => print_json(&store.blame(doc).await?)?,
+        Command::Link {
+            from,
+            to,
+            kind,
+            tier,
+            confidence,
+            note,
+        } => {
+            let rel = NewRelation {
+                from,
+                to,
+                kind,
+                tier,
+                confidence,
+                note,
+            };
+            print_json(&store.link(&actor()?, &rel).await?)?
+        }
+        Command::Unlink { relation } => store.unlink(&actor()?, relation).await?,
+        Command::Promote { relation } => store.promote(&actor()?, relation).await?,
+        Command::Related {
+            node,
+            depth,
+            direction,
+            tier,
+        } => print_json(&store.related(node, depth, direction, &tier).await?)?,
         Command::Query { sql } => print_json(&store.query(&sql).await?)?,
     }
     Ok(())

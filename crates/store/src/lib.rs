@@ -7,6 +7,9 @@
 //! published `read` schema.
 
 pub mod markdown;
+mod relations;
+
+pub use relations::{Direction, NewRelation, Related};
 
 use std::collections::HashMap;
 use std::fmt;
@@ -292,7 +295,8 @@ impl Store {
         let event = EventCtx {
             principal: &principal,
             actor,
-            document: doc,
+            document: Some(doc),
+            relation: None,
             proposal: None,
         };
         event
@@ -469,7 +473,8 @@ impl Store {
         EventCtx {
             principal: &principal,
             actor,
-            document: doc,
+            document: Some(doc),
+            relation: None,
             proposal: Some(proposal),
         }
         .log(
@@ -643,7 +648,8 @@ impl Store {
         let event = EventCtx {
             principal: &principal,
             actor,
-            document: doc,
+            document: Some(doc),
+            relation: None,
             proposal: Some(proposal),
         };
         for c in &changes {
@@ -743,7 +749,8 @@ impl Store {
         EventCtx {
             principal: &principal,
             actor,
-            document: doc,
+            document: Some(doc),
+            relation: None,
             proposal: Some(proposal),
         }
         .log(&mut tx, "proposal_rejected", None, json!({}))
@@ -841,7 +848,8 @@ impl Store {
 struct EventCtx<'a> {
     principal: &'a Principal,
     actor: &'a Actor,
-    document: Uuid,
+    document: Option<Uuid>,
+    relation: Option<Uuid>,
     proposal: Option<Uuid>,
 }
 
@@ -854,8 +862,9 @@ impl EventCtx<'_> {
         payload: serde_json::Value,
     ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO core.events (principal_id, agent, kind, document_id, block_id, proposal_id, payload)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            "INSERT INTO core.events
+                 (principal_id, agent, kind, document_id, block_id, proposal_id, relation_id, payload)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(self.principal.id)
         .bind(&self.actor.agent)
@@ -863,6 +872,7 @@ impl EventCtx<'_> {
         .bind(self.document)
         .bind(block)
         .bind(self.proposal)
+        .bind(self.relation)
         .bind(payload)
         .execute(conn)
         .await?;

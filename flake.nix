@@ -59,7 +59,8 @@
           export PGHOST="$PWD/.pg"
           export PGDATA="$PWD/.pg/data"
           export PGDATABASE=archivar
-          export DATABASE_URL="postgres:///archivar?host=$PWD/.pg"
+          # sqlx does not fall back to $USER for the login, so name it.
+          export DATABASE_URL="postgres:///archivar?host=$PWD/.pg&user=$USER"
           mkdir -p "$PGHOST"
         '';
       };

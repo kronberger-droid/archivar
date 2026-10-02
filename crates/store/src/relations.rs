@@ -127,8 +127,8 @@ impl Store {
         if !rights(&mut tx, &principal, actor, rel.tier).await?.commit {
             return Err(forbidden(actor, "link", rel.tier));
         }
-        let from = node(&mut tx, rel.from).await?;
-        let to = node(&mut tx, rel.to).await?;
+        let from = node(&mut *tx, rel.from).await?;
+        let to = node(&mut *tx, rel.to).await?;
 
         // The unique index would refuse this too, but with a database error
         // that doesn't say which relation is in the way or what to do.
@@ -170,7 +170,7 @@ impl Store {
         .execute(&mut *tx)
         .await?;
 
-        event(&principal, actor, id)
+        EventCtx::relation(&principal, actor, id)
             .log(&mut tx, "relation_asserted", None, json!(rel))
             .await?;
         tx.commit().await?;
@@ -190,7 +190,7 @@ impl Store {
             .bind(relation)
             .execute(&mut *tx)
             .await?;
-        event(&principal, actor, relation)
+        EventCtx::relation(&principal, actor, relation)
             .log(&mut tx, "relation_retracted", None, json!({ "tier": tier }))
             .await?;
         tx.commit().await?;
@@ -224,7 +224,7 @@ impl Store {
         .bind(principal.id)
         .execute(&mut *tx)
         .await?;
-        event(&principal, actor, relation)
+        EventCtx::relation(&principal, actor, relation)
             .log(
                 &mut tx,
                 "relation_promoted",
@@ -252,25 +252,27 @@ impl Store {
         direction: Direction,
         tiers: &[Tier],
     ) -> Result<Vec<Related>> {
-        node(&mut *self.pool.acquire().await?, start).await?;
+        node(&self.pool, start).await?;
         let tiers: Option<Vec<&str>> =
             (!tiers.is_empty()).then(|| tiers.iter().map(|t| t.as_str()).collect());
 
         Ok(sqlx::query_as(
             "WITH RECURSIVE
-             -- Every live relation as an edge leaving `node`, once per direction
-             -- the walk may cross it. Normalising here means the recursive part
-             -- below joins one edge list, which matters: a recursive CTE may
-             -- refer to itself only once, so it can't take `out` and `in` as two
-             -- separate branches.
+             followed AS (
+                 SELECT id, from_node, to_node FROM read.relations
+                 WHERE $4::text[] IS NULL OR tier = ANY($4)
+             ),
+             -- Every followed relation as an edge leaving `node`, once per
+             -- direction the walk may cross it. Normalising here means the
+             -- recursive part below joins one edge list, which matters: a
+             -- recursive CTE may refer to itself only once, so it can't take
+             -- `out` and `in` as two separate branches.
              direct AS (
                  SELECT id, from_node AS node, to_node AS other, 'out' AS direction
-                 FROM read.relations
-                 WHERE $3 IN ('out', 'both') AND ($4::text[] IS NULL OR tier = ANY($4))
+                 FROM followed WHERE $3 IN ('out', 'both')
                  UNION ALL
                  SELECT id, to_node, from_node, 'in'
-                 FROM read.relations
-                 WHERE $3 IN ('in', 'both') AND ($4::text[] IS NULL OR tier = ANY($4))
+                 FROM followed WHERE $3 IN ('in', 'both')
              ),
              -- A document contains its blocks, so an edge leaving a block also
              -- leaves its document. `through` keeps the block it really sits on.
@@ -341,7 +343,7 @@ impl Node {
 
 /// Look up what an id names. Deleted blocks don't count: nothing new should
 /// point at them.
-async fn node(conn: &mut PgConnection, id: Uuid) -> Result<Node> {
+async fn node(conn: impl sqlx::PgExecutor<'_>, id: Uuid) -> Result<Node> {
     let kind: Option<String> = sqlx::query_scalar(
         "SELECT 'document' FROM core.documents WHERE id = $1
          UNION ALL
@@ -368,14 +370,4 @@ async fn live_relation_tier(conn: &mut PgConnection, relation: Uuid) -> Result<T
     .await?;
     tier.ok_or_else(|| Error::NotFound(format!("relation {relation}")))?
         .parse()
-}
-
-fn event<'a>(principal: &'a crate::Principal, actor: &'a Actor, relation: Uuid) -> EventCtx<'a> {
-    EventCtx {
-        principal,
-        actor,
-        document: None,
-        relation: Some(relation),
-        proposal: None,
-    }
 }

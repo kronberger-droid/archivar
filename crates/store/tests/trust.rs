@@ -34,6 +34,21 @@ fn update(block: Uuid, body: &str) -> Vec<Change> {
     }]
 }
 
+fn insert(after: Option<Uuid>, body: &str) -> Vec<Change> {
+    vec![Change::Insert {
+        after,
+        body: body.into(),
+    }]
+}
+
+/// Commit as alice, expecting a conflict, and return the stale blocks.
+async fn expect_conflict(store: &Store, proposal: Uuid) -> Vec<Uuid> {
+    match store.commit(&Actor::human("alice"), proposal).await {
+        Err(Error::Conflict { blocks }) => blocks,
+        other => panic!("expected a conflict, got {other:?}"),
+    }
+}
+
 #[sqlx::test]
 async fn ingest_then_materialize_round_trips(pool: PgPool) {
     let store = setup(pool).await;
@@ -195,10 +210,7 @@ async fn stale_proposals_conflict_per_block_and_apply_nothing(pool: PgPool) {
         .collect();
     assert_eq!(stale, [torque]);
 
-    match store.commit(&alice, both).await {
-        Err(Error::Conflict { blocks }) => assert_eq!(blocks, [torque]),
-        other => panic!("expected a conflict, got {other:?}"),
-    }
+    assert_eq!(expect_conflict(&store, both).await, [torque]);
     // The clean half did not land either.
     let blocks = store.blocks(doc).await.unwrap();
     assert_eq!(blocks[1].body, "Rated for 200 bar.");
@@ -349,20 +361,6 @@ async fn principals_need_a_known_role_and_a_fresh_name(pool: PgPool) {
         store.add_principal("alice", "reader").await,
         Err(Error::Invalid(msg)) if msg.contains("already exists")
     ));
-}
-
-fn insert(after: Option<Uuid>, body: &str) -> Vec<Change> {
-    vec![Change::Insert {
-        after,
-        body: body.into(),
-    }]
-}
-
-async fn expect_conflict(store: &Store, proposal: Uuid) -> Vec<Uuid> {
-    match store.commit(&Actor::human("alice"), proposal).await {
-        Err(Error::Conflict { blocks }) => blocks,
-        other => panic!("expected a conflict, got {other:?}"),
-    }
 }
 
 #[sqlx::test]

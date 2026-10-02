@@ -228,7 +228,7 @@ async fn main() -> anyhow::Result<()> {
                     opts,
                 ),
                 ProposeCmd::Batch { doc, opts } => {
-                    let changes: Vec<Change> = serde_json::from_str(&text_arg("-".into())?)
+                    let changes: Vec<Change> = serde_json::from_str(&read_stdin()?)
                         .context("stdin is not a JSON array of changes")?;
                     (doc, changes, opts)
                 }
@@ -248,11 +248,7 @@ async fn main() -> anyhow::Result<()> {
                 print_json(&review)?
             } else {
                 let p = &review.proposal;
-                let by = match &p.agent {
-                    Some(agent) => format!("{} via {agent}", p.principal),
-                    None => p.principal.clone(),
-                };
-                println!("proposal {} by {by}, {}", p.id, p.status);
+                println!("proposal {} by {}, {}", p.id, p.author(), p.status);
                 if let Some(note) = &p.note {
                     println!("  {note}");
                 }
@@ -297,9 +293,10 @@ async fn main() -> anyhow::Result<()> {
 
 /// `-` means stdin, anything else is the text itself.
 fn text_arg(text: String) -> anyhow::Result<String> {
-    if text != "-" {
-        return Ok(text);
-    }
+    if text == "-" { read_stdin() } else { Ok(text) }
+}
+
+fn read_stdin() -> anyhow::Result<String> {
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf)?;
     if buf.trim().is_empty() {

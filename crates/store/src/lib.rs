@@ -140,6 +140,38 @@ pub enum Change {
     },
 }
 
+/// What a stored proposal change does. Kept as text in the database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Op {
+    Insert,
+    Update,
+    Delete,
+}
+
+impl Op {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Op::Insert => "insert",
+            Op::Update => "update",
+            Op::Delete => "delete",
+        }
+    }
+}
+
+impl TryFrom<String> for Op {
+    type Error = Error;
+
+    fn try_from(s: String) -> Result<Self> {
+        match s.as_str() {
+            "insert" => Ok(Op::Insert),
+            "update" => Ok(Op::Update),
+            "delete" => Ok(Op::Delete),
+            other => Err(Error::Invalid(format!("unknown op `{other}`"))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct Document {
     pub id: Uuid,
@@ -168,6 +200,16 @@ pub struct Proposal {
     pub created_at: DateTime<Utc>,
 }
 
+impl Proposal {
+    /// Who made the proposal, and through which agent.
+    pub fn author(&self) -> Actor {
+        Actor {
+            principal: self.principal.clone(),
+            agent: self.agent.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Review {
     pub proposal: Proposal,
@@ -178,7 +220,7 @@ pub struct Review {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ReviewedChange {
-    pub op: String,
+    pub op: Op,
     pub block_id: Uuid,
     pub base_version: Option<i32>,
     pub current_version: Option<i32>,
@@ -310,13 +352,7 @@ impl Store {
             .bind(tier.as_str())
             .execute(&mut *tx)
             .await?;
-        let event = EventCtx {
-            principal: &principal,
-            actor,
-            document: Some(doc),
-            relation: None,
-            proposal: None,
-        };
+        let event = EventCtx::document(&principal, actor, doc);
         event
             .log(
                 &mut tx,
@@ -328,26 +364,16 @@ impl Store {
 
         for (i, block) in markdown::split(source).into_iter().enumerate() {
             let position = (i + 1) as f64;
-            let id = Uuid::now_v7();
-            sqlx::query(
-                "INSERT INTO core.blocks (id, document_id, position, kind, body)
-                 VALUES ($1, $2, $3, $4, $5)",
+            insert_block(
+                &mut tx,
+                &event,
+                doc,
+                Uuid::now_v7(),
+                position,
+                &block.kind,
+                &block.body,
             )
-            .bind(id)
-            .bind(doc)
-            .bind(position)
-            .bind(&block.kind)
-            .bind(&block.body)
-            .execute(&mut *tx)
             .await?;
-            event
-                .log(
-                    &mut tx,
-                    "block_set",
-                    Some(id),
-                    json!({ "kind": block.kind, "body": block.body, "position": position, "version": 1 }),
-                )
-                .await?;
         }
 
         tx.commit().await?;
@@ -425,58 +451,57 @@ impl Store {
         .execute(&mut *tx)
         .await?;
 
-        // Positions of every block the proposal can refer to, including the
-        // ones it inserts itself, so a later insert can anchor on an earlier one.
-        let current: Vec<Block> = sqlx::query_as(
-            "SELECT id, position, kind, body, version FROM core.blocks
-             WHERE document_id = $1 AND NOT deleted",
+        let current: Vec<(Uuid, f64, i32)> = sqlx::query_as(
+            "SELECT id, position, version FROM core.blocks WHERE document_id = $1 AND NOT deleted",
         )
         .bind(doc)
         .fetch_all(&mut *tx)
         .await?;
-        let versions: HashMap<Uuid, i32> = current.iter().map(|b| (b.id, b.version)).collect();
-        let mut positions: HashMap<Uuid, f64> =
-            current.iter().map(|b| (b.id, b.position)).collect();
+        let versions: HashMap<Uuid, i32> = current.iter().map(|&(id, _, v)| (id, v)).collect();
+        let base_version = |block: &Uuid| {
+            versions
+                .get(block)
+                .copied()
+                .ok_or_else(|| Error::NotFound(format!("block {block} in document {doc}")))
+        };
+        let existing: HashMap<Uuid, f64> = current.iter().map(|&(id, p, _)| (id, p)).collect();
+        // Also the blocks this proposal inserts, so a later insert can anchor
+        // on an earlier one.
+        let mut positions = existing.clone();
 
         for (seq, change) in changes.iter().enumerate() {
             let (op, block, base_version, body, position) = match change {
-                Change::Update { block, body } => {
-                    let version = *versions.get(block).ok_or_else(|| {
-                        Error::NotFound(format!("block {block} in document {doc}"))
-                    })?;
-                    ("update", *block, Some(version), Some(body), None)
-                }
+                Change::Update { block, body } => (
+                    Op::Update,
+                    *block,
+                    Some(base_version(block)?),
+                    Some(body),
+                    None,
+                ),
                 Change::Delete { block } => {
-                    let version = *versions.get(block).ok_or_else(|| {
-                        Error::NotFound(format!("block {block} in document {doc}"))
-                    })?;
-                    ("delete", *block, Some(version), None, None)
+                    (Op::Delete, *block, Some(base_version(block)?), None, None)
                 }
                 Change::Insert { after, body } => {
                     let position = insert_position(&positions, *after)?;
                     let block = Uuid::now_v7();
                     positions.insert(block, position);
-                    ("insert", block, None, Some(body), Some(position))
+                    (Op::Insert, block, None, Some(body), Some(position))
                 }
             };
             // The gap among the blocks that exist now, not the ones this
             // proposal adds: that is what another commit can disturb.
-            let (gap_before, gap_after) = match position {
-                Some(position) => gap_around(&current, position),
-                None => (None, None),
-            };
-            let kind = match body {
-                Some(body) => Some(
-                    markdown::single_block(body)
-                        .ok_or_else(|| {
-                            Error::Invalid(format!(
-                                "change {seq}: body must be exactly one markdown block"
-                            ))
-                        })?
-                        .kind,
-                ),
-                None => None,
-            };
+            let (gap_before, gap_after) = position
+                .map(|p| gap_around(&existing, p))
+                .unwrap_or_default();
+            let kind = body
+                .map(|body| {
+                    markdown::single_block(body).map(|b| b.kind).ok_or_else(|| {
+                        Error::Invalid(format!(
+                            "change {seq}: body must be exactly one markdown block"
+                        ))
+                    })
+                })
+                .transpose()?;
             sqlx::query(
                 "INSERT INTO core.proposal_changes
                      (proposal_id, seq, op, block_id, base_version, kind, body, position,
@@ -485,7 +510,7 @@ impl Store {
             )
             .bind(proposal)
             .bind(seq as i32)
-            .bind(op)
+            .bind(op.as_str())
             .bind(block)
             .bind(base_version)
             .bind(kind)
@@ -497,20 +522,14 @@ impl Store {
             .await?;
         }
 
-        EventCtx {
-            principal: &principal,
-            actor,
-            document: Some(doc),
-            relation: None,
-            proposal: Some(proposal),
-        }
-        .log(
-            &mut tx,
-            "proposal_created",
-            None,
-            json!({ "changes": changes.len(), "note": note }),
-        )
-        .await?;
+        EventCtx::proposal(&principal, actor, doc, proposal)
+            .log(
+                &mut tx,
+                "proposal_created",
+                None,
+                json!({ "changes": changes.len(), "note": note }),
+            )
+            .await?;
 
         tx.commit().await?;
         Ok(proposal)
@@ -518,11 +537,10 @@ impl Store {
 
     pub async fn proposals(&self, doc: Option<Uuid>) -> Result<Vec<Proposal>> {
         Ok(sqlx::query_as(
-            "SELECT pr.id, pr.document_id, p.name AS principal, pr.agent, pr.note,
-                    pr.status, pr.created_at
-             FROM core.proposals pr JOIN core.principals p ON p.id = pr.principal_id
-             WHERE pr.status = 'open' AND ($1::uuid IS NULL OR pr.document_id = $1)
-             ORDER BY pr.created_at",
+            "SELECT id, document_id, principal, agent, note, status, created_at
+             FROM read.proposals
+             WHERE status = 'open' AND ($1::uuid IS NULL OR document_id = $1)
+             ORDER BY created_at",
         )
         .bind(doc)
         .fetch_all(&self.pool)
@@ -531,10 +549,8 @@ impl Store {
 
     pub async fn review(&self, proposal: Uuid) -> Result<Review> {
         let info: Proposal = sqlx::query_as(
-            "SELECT pr.id, pr.document_id, p.name AS principal, pr.agent, pr.note,
-                    pr.status, pr.created_at
-             FROM core.proposals pr JOIN core.principals p ON p.id = pr.principal_id
-             WHERE pr.id = $1",
+            "SELECT id, document_id, principal, agent, note, status, created_at
+             FROM read.proposals WHERE id = $1",
         )
         .bind(proposal)
         .fetch_optional(&self.pool)
@@ -543,20 +559,19 @@ impl Store {
 
         #[derive(sqlx::FromRow)]
         struct Row {
-            op: String,
+            #[sqlx(try_from = "String")]
+            op: Op,
             block_id: Uuid,
             base_version: Option<i32>,
             new_body: Option<String>,
             current_version: Option<i32>,
-            current_deleted: Option<bool>,
             old_body: Option<String>,
-            gap_before: Option<Uuid>,
-            gap_after: Option<Uuid>,
+            fresh: bool,
         }
         let rows: Vec<Row> = sqlx::query_as(
             "SELECT c.op, c.block_id, c.base_version, c.body AS new_body,
-                    b.version AS current_version, b.deleted AS current_deleted,
-                    old.payload->>'body' AS old_body, c.gap_before, c.gap_after
+                    b.version AS current_version, old.payload->>'body' AS old_body,
+                    core.change_is_fresh(c, $2) AS fresh
              FROM core.proposal_changes c
              LEFT JOIN core.blocks b ON b.id = c.block_id
              -- The body the proposal was based on, from the log, not the
@@ -571,42 +586,38 @@ impl Store {
              ORDER BY c.seq",
         )
         .bind(proposal)
+        .bind(info.document_id)
         .fetch_all(&self.pool)
         .await?;
 
-        let mut conn = self.pool.acquire().await?;
         let mut diff = String::new();
-        let mut changes = Vec::with_capacity(rows.len());
-        for r in rows {
-            let stale = if r.op == "insert" {
-                !gap_is_open(&mut conn, info.document_id, r.gap_before, r.gap_after).await?
-            } else {
-                r.current_deleted == Some(true) || r.current_version != r.base_version
-            };
-            let old = r.old_body.as_deref().unwrap_or("");
-            let new = r.new_body.as_deref().unwrap_or("");
-            let header = format!(
-                "{} {}{}",
-                r.op,
-                r.block_id,
-                if stale { " (stale)" } else { "" }
-            );
-            diff.push_str(&format!(
-                "{}",
-                similar::TextDiff::from_lines(format!("{old}\n"), format!("{new}\n"))
+        let changes = rows
+            .into_iter()
+            .map(|r| {
+                let stale = !r.fresh;
+                let old = r.old_body.as_deref().unwrap_or("");
+                let new = r.new_body.as_deref().unwrap_or("");
+                let header = format!(
+                    "{} {}{}",
+                    r.op.as_str(),
+                    r.block_id,
+                    if stale { " (stale)" } else { "" }
+                );
+                diff += &similar::TextDiff::from_lines(format!("{old}\n"), format!("{new}\n"))
                     .unified_diff()
                     .header(&header, &header)
-            ));
-            changes.push(ReviewedChange {
-                op: r.op,
-                block_id: r.block_id,
-                base_version: r.base_version,
-                current_version: r.current_version,
-                old_body: r.old_body,
-                new_body: r.new_body,
-                stale,
-            });
-        }
+                    .to_string();
+                ReviewedChange {
+                    op: r.op,
+                    block_id: r.block_id,
+                    base_version: r.base_version,
+                    current_version: r.current_version,
+                    old_body: r.old_body,
+                    new_body: r.new_body,
+                    stale,
+                }
+            })
+            .collect();
 
         Ok(Review {
             proposal: info,
@@ -621,19 +632,7 @@ impl Store {
     pub async fn commit(&self, actor: &Actor, proposal: Uuid) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         let principal = principal(&mut tx, actor).await?;
-        let (doc, status): (Uuid, String) = sqlx::query_as(
-            "SELECT document_id, status FROM core.proposals WHERE id = $1 FOR UPDATE",
-        )
-        .bind(proposal)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| Error::NotFound(format!("proposal {proposal}")))?;
-        if status != "open" {
-            return Err(Error::Invalid(format!(
-                "proposal {proposal} is already {status}"
-            )));
-        }
-        let tier = document_tier(&mut tx, doc).await?;
+        let (doc, tier) = lock_open_proposal(&mut tx, proposal).await?;
         if tier == Tier::Raw {
             return Err(Error::Immutable);
         }
@@ -641,67 +640,49 @@ impl Store {
             return Err(forbidden(actor, "commit", tier));
         }
 
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            op: String,
-            block_id: Uuid,
-            base_version: Option<i32>,
-            kind: Option<String>,
-            body: Option<String>,
-            position: Option<f64>,
-            gap_before: Option<Uuid>,
-            gap_after: Option<Uuid>,
-        }
-        let changes: Vec<Row> = sqlx::query_as(
-            "SELECT op, block_id, base_version, kind, body, position, gap_before, gap_after
-             FROM core.proposal_changes WHERE proposal_id = $1 ORDER BY seq",
-        )
-        .bind(proposal)
-        .fetch_all(&mut *tx)
-        .await?;
-
         // One commit per document at a time. Locking the blocks a proposal
-        // touches covers updates and deletes, but an insert's gap is defined by
-        // blocks that don't exist yet, and two commits could each find the
-        // same gap empty. Waiting on the document row closes that, and under
-        // READ COMMITTED every check below then sees whatever the commit ahead
-        // of us wrote.
+        // touches would cover updates and deletes, but an insert's gap is
+        // defined by blocks that don't exist yet, and two commits could each
+        // find the same gap empty. Waiting on the document row closes that,
+        // and under READ COMMITTED the check below then sees whatever the
+        // commit ahead of us wrote.
         sqlx::query("SELECT FROM core.documents WHERE id = $1 FOR UPDATE")
             .bind(doc)
             .execute(&mut *tx)
             .await?;
 
-        let mut stale = Vec::new();
-        for c in &changes {
-            let fresh = match c.op.as_str() {
-                "insert" => gap_is_open(&mut tx, doc, c.gap_before, c.gap_after).await?,
-                _ => {
-                    let current: Option<(i32, bool)> =
-                        sqlx::query_as("SELECT version, deleted FROM core.blocks WHERE id = $1")
-                            .bind(c.block_id)
-                            .fetch_optional(&mut *tx)
-                            .await?;
-                    matches!(current, Some((version, false)) if Some(version) == c.base_version)
-                }
-            };
-            if !fresh {
-                stale.push(c.block_id);
-            }
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            #[sqlx(try_from = "String")]
+            op: Op,
+            block_id: Uuid,
+            kind: Option<String>,
+            body: Option<String>,
+            position: Option<f64>,
+            fresh: bool,
         }
+        let changes: Vec<Row> = sqlx::query_as(
+            "SELECT c.op, c.block_id, c.kind, c.body, c.position,
+                    core.change_is_fresh(c, $2) AS fresh
+             FROM core.proposal_changes c WHERE c.proposal_id = $1 ORDER BY c.seq",
+        )
+        .bind(proposal)
+        .bind(doc)
+        .fetch_all(&mut *tx)
+        .await?;
+        let stale: Vec<Uuid> = changes
+            .iter()
+            .filter(|c| !c.fresh)
+            .map(|c| c.block_id)
+            .collect();
         if !stale.is_empty() {
             return Err(Error::Conflict { blocks: stale });
         }
 
-        let event = EventCtx {
-            principal: &principal,
-            actor,
-            document: Some(doc),
-            relation: None,
-            proposal: Some(proposal),
-        };
+        let event = EventCtx::proposal(&principal, actor, doc, proposal);
         for c in &changes {
-            match c.op.as_str() {
-                "update" => {
+            match c.op {
+                Op::Update => {
                     let version: i32 = sqlx::query_scalar(
                         "UPDATE core.blocks SET kind = $2, body = $3, version = version + 1,
                                 updated_at = now()
@@ -721,7 +702,7 @@ impl Store {
                         )
                         .await?;
                 }
-                "delete" => {
+                Op::Delete => {
                     let version: i32 = sqlx::query_scalar(
                         "UPDATE core.blocks SET deleted = true, version = version + 1,
                                 updated_at = now()
@@ -739,28 +720,13 @@ impl Store {
                         )
                         .await?;
                 }
-                "insert" => {
-                    sqlx::query(
-                        "INSERT INTO core.blocks (id, document_id, position, kind, body)
-                         VALUES ($1, $2, $3, $4, $5)",
-                    )
-                    .bind(c.block_id)
-                    .bind(doc)
-                    .bind(c.position)
-                    .bind(&c.kind)
-                    .bind(&c.body)
-                    .execute(&mut *tx)
-                    .await?;
-                    event
-                        .log(
-                            &mut tx,
-                            "block_set",
-                            Some(c.block_id),
-                            json!({ "kind": c.kind, "body": c.body, "position": c.position, "version": 1 }),
-                        )
-                        .await?;
+                Op::Insert => {
+                    let (Some(position), Some(kind), Some(body)) = (c.position, &c.kind, &c.body)
+                    else {
+                        unreachable!("an insert always records position, kind and body");
+                    };
+                    insert_block(&mut tx, &event, doc, c.block_id, position, kind, body).await?;
                 }
-                other => unreachable!("op `{other}` passed the CHECK constraint"),
             }
         }
 
@@ -776,32 +742,14 @@ impl Store {
     pub async fn reject(&self, actor: &Actor, proposal: Uuid) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         let principal = principal(&mut tx, actor).await?;
-        let (doc, status): (Uuid, String) = sqlx::query_as(
-            "SELECT document_id, status FROM core.proposals WHERE id = $1 FOR UPDATE",
-        )
-        .bind(proposal)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| Error::NotFound(format!("proposal {proposal}")))?;
-        if status != "open" {
-            return Err(Error::Invalid(format!(
-                "proposal {proposal} is already {status}"
-            )));
-        }
-        let tier = document_tier(&mut tx, doc).await?;
+        let (doc, tier) = lock_open_proposal(&mut tx, proposal).await?;
         if !rights(&mut tx, &principal, actor, tier).await?.commit {
             return Err(forbidden(actor, "reject", tier));
         }
         decide(&mut tx, proposal, &principal, "rejected").await?;
-        EventCtx {
-            principal: &principal,
-            actor,
-            document: Some(doc),
-            relation: None,
-            proposal: Some(proposal),
-        }
-        .log(&mut tx, "proposal_rejected", None, json!({}))
-        .await?;
+        EventCtx::proposal(&principal, actor, doc, proposal)
+            .log(&mut tx, "proposal_rejected", None, json!({}))
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -868,16 +816,14 @@ impl Store {
     /// split on `;`.
     pub async fn query(&self, sql: &str) -> Result<serde_json::Value> {
         let sql = sql.trim().trim_end_matches(';');
-        let mut tx = self.reader.begin().await?;
-        sqlx::query("SET TRANSACTION READ ONLY")
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("SET LOCAL statement_timeout = '5s'")
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("SET LOCAL search_path = read")
-            .execute(&mut *tx)
-            .await?;
+        let mut tx = self.reader.begin_with("BEGIN READ ONLY").await?;
+        // `true` makes both transaction-local, like SET LOCAL.
+        sqlx::query(
+            "SELECT set_config('statement_timeout', '5s', true),
+                    set_config('search_path', 'read', true)",
+        )
+        .execute(&mut *tx)
+        .await?;
         // `q.*` and not a bare `q`: a bare name resolves to a column first, so
         // a query with a column called `q` would aggregate that column instead
         // of the rows.
@@ -902,7 +848,35 @@ struct EventCtx<'a> {
     proposal: Option<Uuid>,
 }
 
-impl EventCtx<'_> {
+impl<'a> EventCtx<'a> {
+    fn document(principal: &'a Principal, actor: &'a Actor, doc: Uuid) -> Self {
+        Self {
+            principal,
+            actor,
+            document: Some(doc),
+            relation: None,
+            proposal: None,
+        }
+    }
+
+    fn proposal(principal: &'a Principal, actor: &'a Actor, doc: Uuid, proposal: Uuid) -> Self {
+        Self {
+            proposal: Some(proposal),
+            ..Self::document(principal, actor, doc)
+        }
+    }
+
+    /// Relation events carry no document: a link can span two.
+    fn relation(principal: &'a Principal, actor: &'a Actor, relation: Uuid) -> Self {
+        Self {
+            principal,
+            actor,
+            document: None,
+            relation: Some(relation),
+            proposal: None,
+        }
+    }
+
     async fn log(
         &self,
         conn: &mut PgConnection,
@@ -1001,69 +975,86 @@ fn forbidden(actor: &Actor, action: &'static str, tier: Tier) -> Error {
     }
 }
 
+/// Lock a proposal for a decision and return its document and tier. Only an
+/// open proposal can be decided.
+async fn lock_open_proposal(conn: &mut PgConnection, proposal: Uuid) -> Result<(Uuid, Tier)> {
+    let (doc, status, tier): (Uuid, String, String) = sqlx::query_as(
+        "SELECT p.document_id, p.status, d.tier::text
+         FROM core.proposals p JOIN core.documents d ON d.id = p.document_id
+         WHERE p.id = $1
+         FOR UPDATE OF p",
+    )
+    .bind(proposal)
+    .fetch_optional(conn)
+    .await?
+    .ok_or_else(|| Error::NotFound(format!("proposal {proposal}")))?;
+    if status != "open" {
+        return Err(Error::Invalid(format!(
+            "proposal {proposal} is already {status}"
+        )));
+    }
+    Ok((doc, tier.parse()?))
+}
+
+/// Add a block and log it. The `block_set` payload is what `history` and
+/// `review` read bodies and versions back from.
+async fn insert_block(
+    conn: &mut PgConnection,
+    event: &EventCtx<'_>,
+    doc: Uuid,
+    id: Uuid,
+    position: f64,
+    kind: &str,
+    body: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO core.blocks (id, document_id, position, kind, body)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(id)
+    .bind(doc)
+    .bind(position)
+    .bind(kind)
+    .bind(body)
+    .execute(&mut *conn)
+    .await?;
+    event
+        .log(
+            conn,
+            "block_set",
+            Some(id),
+            json!({ "kind": kind, "body": body, "position": position, "version": 1 }),
+        )
+        .await
+}
+
 /// Midpoint between the anchor and the next block, or one step past the end.
 fn insert_position(positions: &HashMap<Uuid, f64>, after: Option<Uuid>) -> Result<f64> {
-    let anchor = match after {
-        Some(id) => *positions
-            .get(&id)
-            .ok_or_else(|| Error::NotFound(format!("anchor block {id}")))?,
-        None => {
-            let first = positions.values().copied().fold(f64::INFINITY, f64::min);
-            return Ok(if first.is_finite() { first - 1.0 } else { 1.0 });
-        }
+    let Some(id) = after else {
+        let first = positions.values().copied().min_by(f64::total_cmp);
+        return Ok(first.map_or(1.0, |first| first - 1.0));
     };
+    let anchor = *positions
+        .get(&id)
+        .ok_or_else(|| Error::NotFound(format!("anchor block {id}")))?;
     let next = positions
         .values()
         .copied()
         .filter(|p| *p > anchor)
-        .fold(f64::INFINITY, f64::min);
-    Ok(if next.is_finite() {
-        (anchor + next) / 2.0
-    } else {
-        anchor + 1.0
-    })
+        .min_by(f64::total_cmp);
+    Ok(next.map_or(anchor + 1.0, |next| (anchor + next) / 2.0))
 }
 
-/// The live blocks right before and after `position`, `None` at either end.
-fn gap_around(blocks: &[Block], position: f64) -> (Option<Uuid>, Option<Uuid>) {
-    let before = blocks
+/// The existing blocks right before and after `position`, `None` at either
+/// end. `core.gap_is_open` later checks the gap is still as found here.
+fn gap_around(existing: &HashMap<Uuid, f64>, position: f64) -> (Option<Uuid>, Option<Uuid>) {
+    let before = existing
         .iter()
-        .filter(|b| b.position < position)
-        .max_by(|a, b| a.position.total_cmp(&b.position));
-    let after = blocks
+        .filter(|&(_, p)| *p < position)
+        .max_by(|a, b| a.1.total_cmp(b.1));
+    let after = existing
         .iter()
-        .filter(|b| b.position > position)
-        .min_by(|a, b| a.position.total_cmp(&b.position));
-    (before.map(|b| b.id), after.map(|b| b.id))
-}
-
-/// Whether an insert's gap is as it was when the insert was proposed: both
-/// ends still live and nothing landed in between. Existing blocks never move,
-/// so that is exactly when its position still means what the reviewer saw.
-async fn gap_is_open(
-    conn: &mut PgConnection,
-    doc: Uuid,
-    before: Option<Uuid>,
-    after: Option<Uuid>,
-) -> Result<bool> {
-    Ok(sqlx::query_scalar(
-        "WITH ends AS (
-             SELECT (SELECT position FROM core.blocks WHERE id = $2 AND NOT deleted) AS lo,
-                    (SELECT position FROM core.blocks WHERE id = $3 AND NOT deleted) AS hi
-         )
-         SELECT ($2::uuid IS NULL OR lo IS NOT NULL)
-            AND ($3::uuid IS NULL OR hi IS NOT NULL)
-            AND NOT EXISTS (
-                SELECT FROM core.blocks b
-                WHERE b.document_id = $1 AND NOT b.deleted
-                  AND ($2::uuid IS NULL OR b.position > lo)
-                  AND ($3::uuid IS NULL OR b.position < hi)
-            )
-         FROM ends",
-    )
-    .bind(doc)
-    .bind(before)
-    .bind(after)
-    .fetch_one(conn)
-    .await?)
+        .filter(|&(_, p)| *p > position)
+        .min_by(|a, b| a.1.total_cmp(b.1));
+    (before.map(|(id, _)| *id), after.map(|(id, _)| *id))
 }

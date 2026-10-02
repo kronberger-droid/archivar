@@ -18,27 +18,26 @@ pub fn split(source: &str) -> Vec<RawBlock> {
     let mut blocks = Vec::new();
     let mut depth = 0usize;
     for (event, range) in Parser::new_ext(source, Options::all()).into_offset_iter() {
-        match event {
+        let top_level = depth == 0;
+        let kind = match event {
             Event::Start(tag) => {
-                if depth == 0 {
-                    blocks.push(RawBlock {
-                        kind: kind_of(&tag).to_owned(),
-                        body: source[range].trim_end().to_owned(),
-                    });
-                }
                 depth += 1;
+                top_level.then(|| kind_of(&tag))
             }
-            Event::End(_) => depth -= 1,
+            Event::End(_) => {
+                depth -= 1;
+                None
+            }
             // Leaf blocks with no Start/End pair.
-            Event::Rule if depth == 0 => blocks.push(RawBlock {
-                kind: "rule".to_owned(),
+            Event::Rule => top_level.then_some("rule"),
+            Event::Html(_) => top_level.then_some("html"),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            blocks.push(RawBlock {
+                kind: kind.to_owned(),
                 body: source[range].trim_end().to_owned(),
-            }),
-            Event::Html(_) if depth == 0 => blocks.push(RawBlock {
-                kind: "html".to_owned(),
-                body: source[range].trim_end().to_owned(),
-            }),
-            _ => {}
+            });
         }
     }
     blocks

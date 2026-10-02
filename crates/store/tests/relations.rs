@@ -40,6 +40,12 @@ fn ids(related: &[Related]) -> Vec<Uuid> {
     related.iter().map(|r| r.relation_id).collect()
 }
 
+/// For comparing sets of ids where the walk order doesn't matter.
+fn sorted(mut ids: Vec<Uuid>) -> Vec<Uuid> {
+    ids.sort();
+    ids
+}
+
 #[sqlx::test]
 async fn agent_links_land_in_derived_with_provenance(pool: PgPool) {
     let store = setup(pool).await;
@@ -253,14 +259,11 @@ async fn related_walks_depth_and_direction_without_looping(pool: PgPool) {
     let walk = |depth, direction, tiers: &'static [Tier]| {
         let store = &store;
         async move {
-            let mut ids = ids(&store.related(a, depth, direction, tiers).await.unwrap());
-            ids.sort();
-            ids
+            sorted(ids(&store
+                .related(a, depth, direction, tiers)
+                .await
+                .unwrap()))
         }
-    };
-    let sorted = |mut v: Vec<Uuid>| {
-        v.sort();
-        v
     };
 
     assert_eq!(walk(1, Direction::Out, &[]).await, sorted(vec![ab, ac]));
@@ -302,11 +305,7 @@ async fn documents_carry_their_blocks_links(pool: PgPool) {
         .unwrap();
 
     let from_a = store.related(a, 3, Direction::Both, &[]).await.unwrap();
-    let mut got = ids(&from_a);
-    got.sort();
-    let mut want = vec![cites, part];
-    want.sort();
-    assert_eq!(got, want);
+    assert_eq!(sorted(ids(&from_a)), sorted(vec![cites, part]));
     let r = from_a.iter().find(|r| r.relation_id == cites).unwrap();
     assert_eq!((r.depth, r.node, r.through), (1, b, Some(para)));
 

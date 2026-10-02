@@ -325,4 +325,15 @@ async fn the_event_log_is_append_only(pool: PgPool) {
             .await
             .is_err()
     );
+    assert!(
+        sqlx::query("TRUNCATE core.events")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    let events: i64 = sqlx::query_scalar("SELECT count(*) FROM core.events")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(events, 4);
 }

@@ -149,6 +149,15 @@ CREATE TRIGGER proposal_changes_immutable
     BEFORE UPDATE OR DELETE ON core.proposal_changes
     FOR EACH ROW EXECUTE FUNCTION core.forbid_mutation();
 
+-- TRUNCATE skips row triggers entirely, so it needs a statement trigger.
+CREATE TRIGGER events_no_truncate
+    BEFORE TRUNCATE ON core.events
+    FOR EACH STATEMENT EXECUTE FUNCTION core.forbid_mutation();
+
+CREATE TRIGGER proposal_changes_no_truncate
+    BEFORE TRUNCATE ON core.proposal_changes
+    FOR EACH STATEMENT EXECUTE FUNCTION core.forbid_mutation();
+
 -- The published read schema ---------------------------------------------------
 --
 -- Views run with the rights of their owner, not of whoever queries them, so a

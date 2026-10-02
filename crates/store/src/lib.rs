@@ -441,6 +441,12 @@ impl Store {
                     ("insert", block, None, Some(body), Some(position))
                 }
             };
+            // The gap among the blocks that exist now, not the ones this
+            // proposal adds: that is what another commit can disturb.
+            let (gap_before, gap_after) = match position {
+                Some(position) => gap_around(&current, position),
+                None => (None, None),
+            };
             let kind = match body {
                 Some(body) => Some(
                     markdown::single_block(body)
@@ -455,8 +461,9 @@ impl Store {
             };
             sqlx::query(
                 "INSERT INTO core.proposal_changes
-                     (proposal_id, seq, op, block_id, base_version, kind, body, position)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                     (proposal_id, seq, op, block_id, base_version, kind, body, position,
+                      gap_before, gap_after)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
             )
             .bind(proposal)
             .bind(seq as i32)
@@ -466,6 +473,8 @@ impl Store {
             .bind(kind)
             .bind(body.map(|b| b.trim_end()))
             .bind(position)
+            .bind(gap_before)
+            .bind(gap_after)
             .execute(&mut *tx)
             .await?;
         }
@@ -523,11 +532,13 @@ impl Store {
             current_version: Option<i32>,
             current_deleted: Option<bool>,
             old_body: Option<String>,
+            gap_before: Option<Uuid>,
+            gap_after: Option<Uuid>,
         }
         let rows: Vec<Row> = sqlx::query_as(
             "SELECT c.op, c.block_id, c.base_version, c.body AS new_body,
                     b.version AS current_version, b.deleted AS current_deleted,
-                    old.payload->>'body' AS old_body
+                    old.payload->>'body' AS old_body, c.gap_before, c.gap_after
              FROM core.proposal_changes c
              LEFT JOIN core.blocks b ON b.id = c.block_id
              -- The body the proposal was based on, from the log, not the
@@ -545,37 +556,39 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
 
+        let mut conn = self.pool.acquire().await?;
         let mut diff = String::new();
-        let changes = rows
-            .into_iter()
-            .map(|r| {
-                let stale = r.base_version.is_some()
-                    && (r.current_deleted == Some(true) || r.current_version != r.base_version);
-                let old = r.old_body.as_deref().unwrap_or("");
-                let new = r.new_body.as_deref().unwrap_or("");
-                let header = format!(
-                    "{} {}{}",
-                    r.op,
-                    r.block_id,
-                    if stale { " (stale)" } else { "" }
-                );
-                diff.push_str(&format!(
-                    "{}",
-                    similar::TextDiff::from_lines(format!("{old}\n"), format!("{new}\n"))
-                        .unified_diff()
-                        .header(&header, &header)
-                ));
-                ReviewedChange {
-                    op: r.op,
-                    block_id: r.block_id,
-                    base_version: r.base_version,
-                    current_version: r.current_version,
-                    old_body: r.old_body,
-                    new_body: r.new_body,
-                    stale,
-                }
-            })
-            .collect();
+        let mut changes = Vec::with_capacity(rows.len());
+        for r in rows {
+            let stale = if r.op == "insert" {
+                !gap_is_open(&mut conn, info.document_id, r.gap_before, r.gap_after).await?
+            } else {
+                r.current_deleted == Some(true) || r.current_version != r.base_version
+            };
+            let old = r.old_body.as_deref().unwrap_or("");
+            let new = r.new_body.as_deref().unwrap_or("");
+            let header = format!(
+                "{} {}{}",
+                r.op,
+                r.block_id,
+                if stale { " (stale)" } else { "" }
+            );
+            diff.push_str(&format!(
+                "{}",
+                similar::TextDiff::from_lines(format!("{old}\n"), format!("{new}\n"))
+                    .unified_diff()
+                    .header(&header, &header)
+            ));
+            changes.push(ReviewedChange {
+                op: r.op,
+                block_id: r.block_id,
+                base_version: r.base_version,
+                current_version: r.current_version,
+                old_body: r.old_body,
+                new_body: r.new_body,
+                stale,
+            });
+        }
 
         Ok(Review {
             proposal: info,
@@ -618,27 +631,43 @@ impl Store {
             kind: Option<String>,
             body: Option<String>,
             position: Option<f64>,
+            gap_before: Option<Uuid>,
+            gap_after: Option<Uuid>,
         }
         let changes: Vec<Row> = sqlx::query_as(
-            "SELECT op, block_id, base_version, kind, body, position
+            "SELECT op, block_id, base_version, kind, body, position, gap_before, gap_after
              FROM core.proposal_changes WHERE proposal_id = $1 ORDER BY seq",
         )
         .bind(proposal)
         .fetch_all(&mut *tx)
         .await?;
 
-        // Lock every block the proposal touches before checking versions, so
-        // nobody can commit in between the check and the write.
+        // One commit per document at a time. Locking the blocks a proposal
+        // touches covers updates and deletes, but an insert's gap is defined by
+        // blocks that don't exist yet, and two commits could each find the
+        // same gap empty. Waiting on the document row closes that, and under
+        // READ COMMITTED every check below then sees whatever the commit ahead
+        // of us wrote.
+        sqlx::query("SELECT FROM core.documents WHERE id = $1 FOR UPDATE")
+            .bind(doc)
+            .execute(&mut *tx)
+            .await?;
+
         let mut stale = Vec::new();
-        for c in changes.iter().filter(|c| c.base_version.is_some()) {
-            let current: Option<(i32, bool)> =
-                sqlx::query_as("SELECT version, deleted FROM core.blocks WHERE id = $1 FOR UPDATE")
-                    .bind(c.block_id)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-            match current {
-                Some((version, false)) if Some(version) == c.base_version => {}
-                _ => stale.push(c.block_id),
+        for c in &changes {
+            let fresh = match c.op.as_str() {
+                "insert" => gap_is_open(&mut tx, doc, c.gap_before, c.gap_after).await?,
+                _ => {
+                    let current: Option<(i32, bool)> =
+                        sqlx::query_as("SELECT version, deleted FROM core.blocks WHERE id = $1")
+                            .bind(c.block_id)
+                            .fetch_optional(&mut *tx)
+                            .await?;
+                    matches!(current, Some((version, false)) if Some(version) == c.base_version)
+                }
+            };
+            if !fresh {
+                stale.push(c.block_id);
             }
         }
         if !stale.is_empty() {
@@ -973,4 +1002,48 @@ fn insert_position(positions: &HashMap<Uuid, f64>, after: Option<Uuid>) -> Resul
     } else {
         anchor + 1.0
     })
+}
+
+/// The live blocks right before and after `position`, `None` at either end.
+fn gap_around(blocks: &[Block], position: f64) -> (Option<Uuid>, Option<Uuid>) {
+    let before = blocks
+        .iter()
+        .filter(|b| b.position < position)
+        .max_by(|a, b| a.position.total_cmp(&b.position));
+    let after = blocks
+        .iter()
+        .filter(|b| b.position > position)
+        .min_by(|a, b| a.position.total_cmp(&b.position));
+    (before.map(|b| b.id), after.map(|b| b.id))
+}
+
+/// Whether an insert's gap is as it was when the insert was proposed: both
+/// ends still live and nothing landed in between. Existing blocks never move,
+/// so that is exactly when its position still means what the reviewer saw.
+async fn gap_is_open(
+    conn: &mut PgConnection,
+    doc: Uuid,
+    before: Option<Uuid>,
+    after: Option<Uuid>,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "WITH ends AS (
+             SELECT (SELECT position FROM core.blocks WHERE id = $2 AND NOT deleted) AS lo,
+                    (SELECT position FROM core.blocks WHERE id = $3 AND NOT deleted) AS hi
+         )
+         SELECT ($2::uuid IS NULL OR lo IS NOT NULL)
+            AND ($3::uuid IS NULL OR hi IS NOT NULL)
+            AND NOT EXISTS (
+                SELECT FROM core.blocks b
+                WHERE b.document_id = $1 AND NOT b.deleted
+                  AND ($2::uuid IS NULL OR b.position > lo)
+                  AND ($3::uuid IS NULL OR b.position < hi)
+            )
+         FROM ends",
+    )
+    .bind(doc)
+    .bind(before)
+    .bind(after)
+    .fetch_one(conn)
+    .await?)
 }

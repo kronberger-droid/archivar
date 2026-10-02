@@ -337,3 +337,119 @@ async fn the_event_log_is_append_only(pool: PgPool) {
         .unwrap();
     assert_eq!(events, 4);
 }
+
+fn insert(after: Option<Uuid>, body: &str) -> Vec<Change> {
+    vec![Change::Insert {
+        after,
+        body: body.into(),
+    }]
+}
+
+async fn expect_conflict(store: &Store, proposal: Uuid) -> Vec<Uuid> {
+    match store.commit(&Actor::human("alice"), proposal).await {
+        Err(Error::Conflict { blocks }) => blocks,
+        other => panic!("expected a conflict, got {other:?}"),
+    }
+}
+
+#[sqlx::test]
+async fn inserts_into_the_same_gap_conflict(pool: PgPool) {
+    let store = setup(pool).await;
+    let alice = Actor::human("alice");
+    let doc = store
+        .ingest(&alice, "Cell", Tier::Canonical, DOC)
+        .await
+        .unwrap();
+    let heading = block_ids(&store, doc).await[0];
+
+    let first = store
+        .propose(&alice, doc, None, &insert(Some(heading), "Bought 2024."))
+        .await
+        .unwrap();
+    let second = store
+        .propose(&alice, doc, None, &insert(Some(heading), "Made in Vienna."))
+        .await
+        .unwrap();
+    store.commit(&alice, first).await.unwrap();
+
+    // Both computed the same midpoint, so landing the second would leave the
+    // order of the two up to chance. It is stale instead.
+    let review = store.review(second).await.unwrap();
+    assert!(review.changes[0].stale);
+    let inserted = review.changes[0].block_id;
+    assert_eq!(expect_conflict(&store, second).await, [inserted]);
+    assert_eq!(
+        store.materialize(doc).await.unwrap(),
+        "# Cell\n\nBought 2024.\n\nRated for 200 bar.\n\nTorque 12 Nm.\n"
+    );
+}
+
+#[sqlx::test]
+async fn inserts_after_a_deleted_block_conflict(pool: PgPool) {
+    let store = setup(pool).await;
+    let alice = Actor::human("alice");
+    let doc = store
+        .ingest(&alice, "Cell", Tier::Canonical, DOC)
+        .await
+        .unwrap();
+    let rating = block_ids(&store, doc).await[1];
+
+    let p = store
+        .propose(&alice, doc, None, &insert(Some(rating), "At 20 C."))
+        .await
+        .unwrap();
+    let delete = store
+        .propose(&alice, doc, None, &[Change::Delete { block: rating }])
+        .await
+        .unwrap();
+    store.commit(&alice, delete).await.unwrap();
+
+    assert_eq!(expect_conflict(&store, p).await.len(), 1);
+}
+
+#[sqlx::test]
+async fn inserts_at_the_start_conflict_with_each_other(pool: PgPool) {
+    let store = setup(pool).await;
+    let alice = Actor::human("alice");
+    let doc = store
+        .ingest(&alice, "Cell", Tier::Canonical, DOC)
+        .await
+        .unwrap();
+    let first = store
+        .propose(&alice, doc, None, &insert(None, "---"))
+        .await
+        .unwrap();
+    let second = store
+        .propose(&alice, doc, None, &insert(None, "Draft."))
+        .await
+        .unwrap();
+    store.commit(&alice, first).await.unwrap();
+    assert_eq!(expect_conflict(&store, second).await.len(), 1);
+}
+
+#[sqlx::test]
+async fn editing_the_anchor_leaves_an_insert_fresh(pool: PgPool) {
+    let store = setup(pool).await;
+    let alice = Actor::human("alice");
+    let doc = store
+        .ingest(&alice, "Cell", Tier::Canonical, DOC)
+        .await
+        .unwrap();
+    let ids = block_ids(&store, doc).await;
+
+    // Placement depends on where the neighbours are, not what they say.
+    let p = store
+        .propose(&alice, doc, None, &insert(Some(ids[1]), "At 20 C."))
+        .await
+        .unwrap();
+    let edit = store
+        .propose(&alice, doc, None, &update(ids[1], "Rated for 250 bar."))
+        .await
+        .unwrap();
+    store.commit(&alice, edit).await.unwrap();
+    store.commit(&alice, p).await.unwrap();
+    assert_eq!(
+        store.materialize(doc).await.unwrap(),
+        "# Cell\n\nRated for 250 bar.\n\nAt 20 C.\n\nTorque 12 Nm.\n"
+    );
+}

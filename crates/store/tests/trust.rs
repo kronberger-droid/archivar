@@ -338,6 +338,19 @@ async fn the_event_log_is_append_only(pool: PgPool) {
     assert_eq!(events, 4);
 }
 
+#[sqlx::test]
+async fn principals_need_a_known_role_and_a_fresh_name(pool: PgPool) {
+    let store = setup(pool).await;
+    assert!(matches!(
+        store.add_principal("eve", "superuser").await,
+        Err(Error::Invalid(msg)) if msg.contains("unknown role")
+    ));
+    assert!(matches!(
+        store.add_principal("alice", "reader").await,
+        Err(Error::Invalid(msg)) if msg.contains("already exists")
+    ));
+}
+
 fn insert(after: Option<Uuid>, body: &str) -> Vec<Change> {
     vec![Change::Insert {
         after,

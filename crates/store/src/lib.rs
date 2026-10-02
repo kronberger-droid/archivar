@@ -264,13 +264,28 @@ impl Store {
     /// holds the database URL is admin.
     pub async fn add_principal(&self, name: &str, role: &str) -> Result<Uuid> {
         let id = Uuid::now_v7();
-        sqlx::query("INSERT INTO core.principals (id, name, role) VALUES ($1, $2, $3)")
-            .bind(id)
-            .bind(name)
-            .bind(role)
-            .execute(&self.pool)
-            .await?;
-        Ok(id)
+        let inserted =
+            sqlx::query("INSERT INTO core.principals (id, name, role) VALUES ($1, $2, $3)")
+                .bind(id)
+                .bind(name)
+                .bind(role)
+                .execute(&self.pool)
+                .await;
+        // Roles are rows in core.roles, not a Rust enum, so the constraints are
+        // what knows a role is unknown. Translate them instead of duplicating.
+        match inserted {
+            Ok(_) => Ok(id),
+            Err(sqlx::Error::Database(e)) => match e.kind() {
+                sqlx::error::ErrorKind::ForeignKeyViolation => {
+                    Err(Error::Invalid(format!("unknown role `{role}`")))
+                }
+                sqlx::error::ErrorKind::UniqueViolation => {
+                    Err(Error::Invalid(format!("principal `{name}` already exists")))
+                }
+                _ => Err(sqlx::Error::Database(e).into()),
+            },
+            Err(e) => Err(e.into()),
+        }
     }
 
     // Documents -----------------------------------------------------------

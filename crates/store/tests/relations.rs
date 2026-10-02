@@ -286,6 +286,37 @@ async fn related_walks_depth_and_direction_without_looping(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn documents_carry_their_blocks_links(pool: PgPool) {
+    let store = setup(pool).await;
+    let (a, b) = (doc(&store, "A").await, doc(&store, "B").await);
+    let alice = Actor::human("alice");
+    let para = store.blocks(a).await.unwrap()[1].id;
+    let cites = store
+        .link(&alice, &rel(para, b, "cites", Tier::Derived))
+        .await
+        .unwrap();
+    // A block pointing at its own document must not send the walk in circles.
+    let part = store
+        .link(&alice, &rel(para, a, "part-of", Tier::Derived))
+        .await
+        .unwrap();
+
+    let from_a = store.related(a, 3, Direction::Both, &[]).await.unwrap();
+    let mut got = ids(&from_a);
+    got.sort();
+    let mut want = vec![cites, part];
+    want.sort();
+    assert_eq!(got, want);
+    let r = from_a.iter().find(|r| r.relation_id == cites).unwrap();
+    assert_eq!((r.depth, r.node, r.through), (1, b, Some(para)));
+
+    // From the other end the block is reached as itself, not lifted.
+    let from_b = store.related(b, 1, Direction::In, &[]).await.unwrap();
+    assert_eq!(ids(&from_b), [cites]);
+    assert_eq!((from_b[0].node, from_b[0].through), (para, None));
+}
+
+#[sqlx::test]
 async fn links_to_deleted_blocks_drop_out(pool: PgPool) {
     let store = setup(pool).await;
     let (a, b) = (doc(&store, "A").await, doc(&store, "B").await);

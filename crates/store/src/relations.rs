@@ -76,6 +76,9 @@ pub struct Related {
     pub depth: i32,
     /// `out` when the relation points away from the node the walk came from.
     pub direction: String,
+    /// Set when the step left a document by a relation on one of its blocks:
+    /// that block.
+    pub through: Option<Uuid>,
     /// The node this step arrived at.
     pub node: Uuid,
     /// `document` or `block`.
@@ -235,6 +238,10 @@ impl Store {
 
     /// Walk the relation graph from a document or block, up to `depth` steps.
     ///
+    /// Standing on a document, the walk also follows relations on its blocks,
+    /// and says so in [`Related::through`]. Standing on a block, it follows
+    /// only that block's own relations.
+    ///
     /// Every relation reached comes back once, at the shallowest depth it was
     /// found. `tiers` limits which relations the walk may follow, so a walk
     /// over `[Canonical]` only crosses human-approved links; empty means all.
@@ -256,7 +263,7 @@ impl Store {
              -- below joins one edge list, which matters: a recursive CTE may
              -- refer to itself only once, so it can't take `out` and `in` as two
              -- separate branches.
-             edges AS (
+             direct AS (
                  SELECT id, from_node AS node, to_node AS other, 'out' AS direction
                  FROM read.relations
                  WHERE $3 IN ('out', 'both') AND ($4::text[] IS NULL OR tier = ANY($4))
@@ -265,6 +272,16 @@ impl Store {
                  FROM read.relations
                  WHERE $3 IN ('in', 'both') AND ($4::text[] IS NULL OR tier = ANY($4))
              ),
+             -- A document contains its blocks, so an edge leaving a block also
+             -- leaves its document. `through` keeps the block it really sits on.
+             edges AS (
+                 SELECT id, node, other, direction, NULL::uuid AS through
+                 FROM direct
+                 UNION ALL
+                 SELECT e.id, b.document_id, e.other, e.direction, e.node
+                 FROM direct e
+                 JOIN core.blocks b ON b.id = e.node
+             ),
              -- The anchor takes the first step, the recursive part every next
              -- one. `path` holds the nodes already on this walk. A step back onto
              -- one of them is still reported, since that relation is as related
@@ -272,25 +289,27 @@ impl Store {
              -- ends cycles; `depth` ends everything else. (Postgres 14 has a
              -- CYCLE clause for exactly this; spelled out here to show it.)
              walk AS (
-                 SELECT e.id AS relation_id, e.other AS node, e.direction,
-                        1 AS depth, ARRAY[$1::uuid, e.other] AS path, false AS closed
+                 SELECT e.id AS relation_id, e.other AS node, e.direction, e.through,
+                        1 AS depth, ARRAY[$1::uuid, e.other] AS path,
+                        e.other = $1 AS closed
                  FROM edges e
                  WHERE e.node = $1
                  UNION ALL
-                 SELECT e.id, e.other, e.direction, w.depth + 1, w.path || e.other,
-                        e.other = ANY(w.path)
+                 SELECT e.id, e.other, e.direction, e.through, w.depth + 1,
+                        w.path || e.other, e.other = ANY(w.path)
                  FROM walk w
                  JOIN edges e ON e.node = w.node
                  WHERE w.depth < $2 AND NOT w.closed
              ),
-             -- Several paths can reach the same relation; keep the shortest.
+             -- Several paths can reach the same relation; keep the shortest,
+             -- and at equal depth the one that didn't go through a block.
              -- DISTINCT ON keeps the first row per relation in ORDER BY order.
              nearest AS (
-                 SELECT DISTINCT ON (relation_id) relation_id, node, direction, depth
+                 SELECT DISTINCT ON (relation_id) relation_id, node, direction, through, depth
                  FROM walk
-                 ORDER BY relation_id, depth
+                 ORDER BY relation_id, depth, through NULLS FIRST
              )
-             SELECT n.relation_id, n.depth, n.direction, n.node,
+             SELECT n.relation_id, n.depth, n.direction, n.through, n.node,
                     CASE WHEN d.id IS NULL THEN 'block' ELSE 'document' END AS node_kind,
                     coalesce(d.title, left(b.body, 80)) AS node_label,
                     r.from_node, r.to_node, r.kind, r.tier, r.confidence, r.note,
